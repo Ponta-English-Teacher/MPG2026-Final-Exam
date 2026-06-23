@@ -1,0 +1,23 @@
+{
+  "name": "p07-quiz",
+  "version": "1.0.0",
+  "description": "A standalone, mobile-friendly web quiz for **Modern Pronunciation and Grammar 2026**. Topic: **Prepositions — Schema, Movement & Idioms**",
+  "main": "generate-p06-audio.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ponta-English-Teacher/mpg2026-p06-preposition-quiz.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Ponta-English-Teacher/mpg2026-p06-preposition-quiz/issues"
+  },
+  "homepage": "https://github.com/Ponta-English-Teacher/mpg2026-p06-preposition-quiz#readme",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}

@@ -1,0 +1,11 @@
+# Environment — never commit real API keys
+.env
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Generated audio files — regenerate with generate-p07-audio.js
+audio/*.mp3
