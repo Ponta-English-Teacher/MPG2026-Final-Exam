@@ -7,9 +7,9 @@ const KEY    = process.env.AZURE_TTS_KEY || "YOUR_AZURE_KEY_HERE";
 const REGION = process.env.AZURE_REGION  || "eastus";
 
 const sentences = [
-  { file: "p09_q25.mp3", text: "The author who wrote this novel is Canadian." },
-  { file: "p09_q26.mp3", text: "The town where she grew up has changed." },
-  { file: "p09_q27.mp3", text: "The student whose phone rang apologized quickly." },
+  { file: "p10_q31.mp3", text: "Nothing is more important than good health." },
+  { file: "p10_q32.mp3", text: "The more you practice, the more confident you become." },
+  { file: "p10_q33.mp3", text: "This smartphone is superior to the old model." },
 ];
 
 const OUTPUT_DIR = path.join(__dirname, "audio");
