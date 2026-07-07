@@ -1,5 +1,5 @@
 {
-  "name": "p10-quiz",
+  "name": "p11-quiz",
   "version": "1.0.0",
   "description": "A standalone, mobile-friendly web quiz for **Modern Pronunciation and Grammar 2026**. Topic: **Prepositions — Schema, Movement & Idioms**",
   "main": "generate-p06-audio.js",
