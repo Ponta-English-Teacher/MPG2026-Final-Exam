@@ -55,7 +55,7 @@ const QUESTIONS = [
   {
     id: 2, type: "mc",
     bankId: "L03-Q05", examSection: "multiple-choice",
-    stem: "What is the sentence pattern? <em>She made him a good teacher.</em>",
+    stem: "What is the sentence pattern? <em>She made him her husband.</em>",
     options: {
       A: "SVOO",
       B: "SVOC",
