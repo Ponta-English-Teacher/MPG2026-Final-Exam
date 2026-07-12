@@ -7,22 +7,38 @@
 //    Who has access: Anyone
 //
 //  The spreadsheet must have a sheet named "Responses".
-//  Column headers will be written automatically on first use.
+//  Column headers will be written automatically on first use, and
+//  extended (never overwritten or reordered) if new columns are needed.
 // ============================================================
 
 const SHEET_NAME = "Responses";
 
-// Expected column order (must match frontend payload keys)
+// Canonical column order for a brand-new "Responses" sheet.
+const Q_COLUMNS = [];
+for (let i = 1; i <= 95; i++) Q_COLUMNS.push("Q" + i);
+
 const COLUMNS = [
-  "Timestamp", "CourseID", "LessonID", "QuizID",
-  "StudentID", "Name",
-  "Q1","Q2","Q3","Q4","Q5","Q6","Q7","Q8","Q9","Q10",
-  "Q11","Q12","Q13","Q14","Q15","Q16","Q17","Q18","Q19","Q20",
-  "Q21","Q22","Q23","Q24","Q25","Q26","Q27","Q28","Q29","Q30",
-  "Q31","Q32","Q33","Q34","Q35","Q36","Q37","Q38","Q39","Q40",
-  "Q41","Q42","Q43","Q44","Q45","Q46","Q47","Q48","Q49","Q50",
-  "Score", "Percentage", "Comment", "Attempt"
+  "Name", "Student ID", "Score", "Total Questions", "Percentage", "Tentative Grade",
+  ...Q_COLUMNS,
+  "Class Feedback", "Instructor Grade", "Bonus Points Reported", "Free Comments",
+  "Submitted At",
 ];
+
+// Maps a header label to the payload field name, only where they differ.
+// Any header not listed here (e.g. "Q1"..."Q95", "Name", "Score", or a
+// legacy column from an older sheet like "CourseID"/"Attempt"/"Comment")
+// is looked up using the header text itself as the key — this keeps old
+// sheets/columns working without needing every possible key listed here.
+const HEADER_TO_KEY = {
+  "Student ID":           "StudentID",
+  "Total Questions":      "TotalQuestions",
+  "Tentative Grade":      "TentativeGrade",
+  "Class Feedback":       "classFeedback",
+  "Instructor Grade":     "instructorGrade",
+  "Bonus Points Reported": "bonusPointsReported",
+  "Free Comments":        "freeComments",
+  "Submitted At":         "Timestamp",
+};
 
 // ── Entry point ────────────────────────────────────────────────
 function doPost(e) {
@@ -33,8 +49,8 @@ function doPost(e) {
     const body = JSON.parse(e.postData.contents);
     const sheet = getOrCreateSheet();
 
-    ensureHeaders(sheet);
-    appendRow(sheet, body);
+    const headers = ensureHeaders(sheet);
+    appendRow(sheet, body, headers);
 
     return jsonResponse({ result: "success" });
   } catch (err) {
@@ -59,21 +75,48 @@ function getOrCreateSheet() {
   return sheet;
 }
 
+// Returns the sheet's full, current header row (an array of strings).
+// - Brand-new sheet (no header yet): writes the canonical COLUMNS header.
+// - Existing sheet: NEVER overwritten/reordered/cleared. Any column in
+//   COLUMNS that the sheet doesn't already have is appended to the right,
+//   so existing header cells and every already-written row stay exactly
+//   where they are.
 function ensureHeaders(sheet) {
   if (sheet.getLastRow() === 0) {
-    sheet.appendRow(COLUMNS);
-    sheet.getRange(1, 1, 1, COLUMNS.length)
-      .setFontWeight("bold")
-      .setBackground("#2c4a6e")
-      .setFontColor("#ffffff");
-    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, COLUMNS.length).setValues([COLUMNS]);
+    styleHeaderRow(sheet, COLUMNS.length);
+    return COLUMNS;
   }
+
+  const lastCol = sheet.getLastColumn();
+  const existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const existingSet = new Set(existingHeaders);
+  const missing = COLUMNS.filter(h => !existingSet.has(h));
+
+  if (missing.length > 0) {
+    sheet.getRange(1, lastCol + 1, 1, missing.length).setValues([missing]);
+    styleHeaderRow(sheet, lastCol + missing.length);
+  }
+
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 }
 
-function appendRow(sheet, data) {
-  const row = COLUMNS.map(col => {
-    const val = data[col];
-    return val !== undefined && val !== null ? val : "";
+function styleHeaderRow(sheet, numCols) {
+  sheet.getRange(1, 1, 1, numCols)
+    .setFontWeight("bold")
+    .setBackground("#2c4a6e")
+    .setFontColor("#ffffff");
+  sheet.setFrozenRows(1);
+}
+
+// Builds one row aligned exactly to the sheet's current header (so the row
+// always has the same number of values as there are header columns), then
+// appends it as a new row — existing rows are never touched.
+function appendRow(sheet, data, headers) {
+  const row = headers.map(header => {
+    const key = HEADER_TO_KEY[header] || header;
+    const val = data[key];
+    return (val !== undefined && val !== null) ? val : "";
   });
   sheet.appendRow(row);
 }

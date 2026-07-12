@@ -7,18 +7,50 @@
 
 // ── Backend URL ────────────────────────────────────────────────
 const SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycbzwYEyvjjSGGh--CH8xu-kp2cMC27k9YeulJS-mlsR03eNVa7E3PHrpyHJniJv8FuomMw/exec";
+  "https://script.google.com/macros/s/AKfycbw2rGaPKbCdqxQ-U-j_bXTBmQLrQfUAmBh8zG5nSy7bLHMgLFBx68YSk0a-mimEBfU_4A/exec";
 
 // ── State ──────────────────────────────────────────────────────
+// Unscored Course Feedback step — never affects the exam score.
+function emptyFeedback() {
+  return {
+    classFeedback:        "",
+    instructorGrade:      "",
+    bonusPointsReported:  "",
+    freeComments:         "",
+  };
+}
+
 const state = {
   studentID: "",
   name:      "",
   current:   0,           // 0-based index
-  answers:   {},          // { questionId: { value, checked, correct } }
-  checked:   {},          // { questionId: true } — which questions have been checked
+  answers:   {},          // { questionId: { value } } — raw answers only; correctness is
+                          // computed on demand from these, never stored or shown pre-submission
   dragState: {},          // { questionId: [ordered tokens] }
   attempt:   0,   // ← ADD THIS LINE
+  feedback:  emptyFeedback(),
+  feedbackDone: false,    // true once the Course Feedback step has been completed
 };
+
+// ── Course Feedback (unscored, not part of QUESTIONS / scoring) ────────────
+const FEEDBACK_NOTE =
+  "These questions do not affect your exam score. They are used only for course evaluation.";
+
+const CLASS_FEEDBACK_OPTIONS = [
+  "I liked it very much.",
+  "I liked it.",
+  "It was okay.",
+  "I did not like it very much.",
+  "I did not like it.",
+];
+
+const INSTRUCTOR_GRADE_OPTIONS = ["A+", "A", "B", "C", "D", "F"];
+
+const FREE_COMMENTS_PROMPT =
+  "Write anything you would like to tell me about this class.\n\n" +
+  "If there is anything I should consider when grading your performance in this class, please explain it here. " +
+  "For example, you may mention unavoidable absences due to teaching practicum, special training, nursing-care " +
+  "practicum (介護等実習), illness, or other important circumstances.";
 
 // ── DOM refs ───────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -38,13 +70,6 @@ function normaliseDictation(str) {
     .trim();
 }
 
-// ── Strip HTML tags for plain text (feedback) ──────────────────
-function stripHTML(html) {
-  const div = document.createElement("div");
-  div.innerHTML = html;
-  return div.textContent || "";
-}
-
 // ── Comment band lookup ────────────────────────────────────────
 function getComment(score) {
   for (const band of COMMENT_BANDS) {
@@ -58,12 +83,86 @@ function getSectionInfo(qId) {
   return SECTIONS.find(s => s.questions.includes(qId));
 }
 
-// ── Score calculation ─────────────────────────────────────────
+// ============================================================
+//  CORRECTNESS  (computed only at submission time — never surfaced
+//  to the student during the exam; this is a real final exam, not
+//  a practice quiz, so nothing here may drive UI feedback pre-submit)
+// ============================================================
+
+function dragDropArranged(q) {
+  const arranged = state.dragState[q.id];
+  return Array.isArray(arranged) ? arranged : [];
+}
+
+function isMCCorrect(q, ans) {
+  return !!(ans && ans.value === q.correct);
+}
+
+function isDragDropCorrect(q) {
+  const arranged = dragDropArranged(q);
+  if (arranged.length === 0) return false;
+  const fullArranged = [...(q.fixedStart || []), ...arranged];
+  const fullStr = JSON.stringify(fullArranged);
+  return Array.isArray(q.corrects)
+    ? q.corrects.some(c => JSON.stringify(c) === fullStr)
+    : fullStr === JSON.stringify(q.correct);
+}
+
+function isFillinCorrect(q, ans) {
+  if (!ans || !ans.value) return false;
+  const typed    = ans.value.trim().toLowerCase();
+  const accepted = Array.isArray(q.correct) ? q.correct : [q.correct];
+  return accepted.some(a => a.toLowerCase() === typed);
+}
+
+function isDictationCorrect(q, ans) {
+  if (!ans || !ans.value) return false;
+  return normaliseDictation(ans.value) === normaliseDictation(q.correct);
+}
+
+function isDictationAnalysisCorrect(q, ans) {
+  if (!ans || !ans.dictValue || !ans.analysisValue) return false;
+  const dictOK   = normaliseDictation(ans.dictValue) === normaliseDictation(q.correct);
+  const analysOK = ans.analysisValue === q.correctAnalysis;
+  return dictOK && analysOK;
+}
+
+function isCorrect(q) {
+  const ans = state.answers[q.id];
+  switch (q.type) {
+    case "mc":                return isMCCorrect(q, ans);
+    case "dragdrop":           return isDragDropCorrect(q);
+    case "fillin":             return isFillinCorrect(q, ans);
+    case "dictation":          return isDictationCorrect(q, ans);
+    case "dictation_analysis": return isDictationAnalysisCorrect(q, ans);
+    default:                   return false;
+  }
+}
+
+// ── Has the student answered this question? Drives whether "Next" is
+// enabled. This is presence-of-an-answer only — it never reveals or
+// implies correctness. ──────────────────────────────────────────────
+function isAnswered(q) {
+  const ans = state.answers[q.id];
+  switch (q.type) {
+    case "mc":                return !!(ans && ans.value);
+    case "dragdrop":           return dragDropArranged(q).length > 0;
+    case "fillin":             return !!(ans && ans.value && ans.value.trim());
+    case "dictation":          return !!(ans && ans.value && ans.value.trim());
+    case "dictation_analysis": return !!(ans && ans.dictValue && ans.dictValue.trim() && ans.analysisValue);
+    default:                   return false;
+  }
+}
+
+function refreshNextButton() {
+  $("btn-next").disabled = !isAnswered(QUESTIONS[state.current]);
+}
+
+// ── Score calculation — computed once, only at submission ──────────
 function calcScore() {
   let total = 0;
   for (const q of QUESTIONS) {
-    const ans = state.answers[q.id];
-    if (ans && ans.correct) total++;
+    if (isCorrect(q)) total++;
   }
   return total;
 }
@@ -106,10 +205,14 @@ function renderQuestion(index) {
   // ── Nav buttons ──
   $("btn-back").disabled = (index === 0);
   $("btn-next").textContent =
-    index === QUESTIONS.length - 1 ? "Finish Quiz" : "Next →";
+    index === QUESTIONS.length - 1 ? "Continue to Course Feedback →" : "Next →";
+  refreshNextButton();
 }
 
 // ── Multiple Choice ────────────────────────────────────────────
+// Real-exam behavior: no Check button, no correct/incorrect feedback.
+// The chosen option is saved silently and can be changed at any time
+// before the exam is submitted.
 function renderMC(q, container) {
   const stem = document.createElement("div");
   stem.className = "question-stem";
@@ -119,8 +222,7 @@ function renderMC(q, container) {
   const list = document.createElement("div");
   list.className = "options-list";
 
-  const saved    = state.answers[q.id];
-  const isChecked = state.checked[q.id];
+  const saved = state.answers[q.id];
 
   for (const [key, label] of Object.entries(q.options)) {
     const btn = document.createElement("button");
@@ -129,83 +231,24 @@ function renderMC(q, container) {
     btn.innerHTML = `<span class="option-key">${key}</span> ${label}`;
 
     if (saved && saved.value === key) btn.classList.add("selected");
-    if (isChecked) {
-      btn.disabled = true;
-      if (key === q.correct) btn.classList.add("correct-ans");
-      else if (saved && saved.value === key && key !== q.correct)
-        btn.classList.add("wrong-ans");
-    } else {
-      btn.addEventListener("click", () => {
-        list.querySelectorAll(".option-btn").forEach(b => b.classList.remove("selected"));
-        btn.classList.add("selected");
-        state.answers[q.id] = { value: key, checked: false, correct: false };
-        saveProgress();
-      });
-    }
+
+    btn.addEventListener("click", () => {
+      list.querySelectorAll(".option-btn").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      state.answers[q.id] = { value: key };
+      saveProgress();
+      refreshNextButton();
+    });
+
     list.appendChild(btn);
   }
   container.appendChild(list);
-
-  // Check button
-  if (!isChecked) {
-    const checkRow = document.createElement("div");
-    checkRow.className = "check-btn-row";
-    const checkBtn = document.createElement("button");
-    checkBtn.className = "btn btn-accent";
-    checkBtn.textContent = "Check";
-    checkBtn.addEventListener("click", () => checkMC(q, container, list));
-    checkRow.appendChild(checkBtn);
-    container.appendChild(checkRow);
-  }
-
-  // Feedback (restore if already checked)
-  const fb = document.createElement("div");
-  fb.className = "feedback-box";
-  fb.id        = `fb-${q.id}`;
-  container.appendChild(fb);
-
-  if (isChecked && saved) {
-    showMCFeedback(q, fb, saved.value);
-  }
-}
-
-function checkMC(q, container, list) {
-  const selected = list.querySelector(".option-btn.selected");
-  if (!selected) { alert("Please select an answer first."); return; }
-
-  const chosen  = selected.dataset.key;
-  const isRight = chosen === q.correct;
-
-  state.answers[q.id] = { value: chosen, checked: true, correct: isRight };
-  state.checked[q.id] = true;
-  saveProgress();
-
-  // Disable all, colour them
-  list.querySelectorAll(".option-btn").forEach(btn => {
-    btn.disabled = true;
-    if (btn.dataset.key === q.correct) btn.classList.add("correct-ans");
-    else if (btn.dataset.key === chosen) btn.classList.add("wrong-ans");
-  });
-
-  // Remove check button
-  container.querySelector(".check-btn-row")?.remove();
-
-  const fb = $(`fb-${q.id}`);
-  showMCFeedback(q, fb, chosen);
-}
-
-function showMCFeedback(q, fb, chosen) {
-  const isRight = chosen === q.correct;
-  fb.classList.add("visible", isRight ? "correct" : "incorrect");
-  fb.innerHTML = `
-    <div class="feedback-verdict">${isRight ? "✓ Correct" : "✗ Incorrect"}</div>
-    <div class="feedback-detail">
-      Correct answer: <strong>${q.correct}. ${q.options[q.correct]}</strong><br>
-      ${q.explanation}
-    </div>`;
 }
 
 // ── Drag and Drop ─────────────────────────────────────────────
+// Real-exam behavior: no Check button, no correct/incorrect feedback.
+// "Reset Sentence" just clears the current arrangement — it does not
+// reveal anything about correctness.
 function renderDragDrop(q, container) {
   const stem = document.createElement("div");
   stem.className = "question-stem";
@@ -217,7 +260,6 @@ function renderDragDrop(q, container) {
   hint.textContent = "Drag the blocks into the correct order.";
   container.appendChild(hint);
 
-  const isChecked = state.checked[q.id];
   const savedOrder = state.dragState[q.id];
 
   // Current arrangement and pool state
@@ -274,35 +316,31 @@ function renderDragDrop(q, container) {
     const token = document.createElement("span");
     token.className = "drag-token";
     token.textContent = text;
-    token.draggable = !isChecked;
+    token.draggable = true;
     token.dataset.text = text;
 
-    if (!isChecked) {
-      // Click to move between zones
-      token.addEventListener("click", () => {
-        if (inAnswer) {
-          poolZone.appendChild(token);
-          inAnswer = false;
-        } else {
-          ansZone.appendChild(token);
-          inAnswer = true;
-        }
-        persistDragState(q.id, ansZone);
-      });
+    // Click to move between zones
+    token.addEventListener("click", () => {
+      if (inAnswer) {
+        poolZone.appendChild(token);
+        inAnswer = false;
+      } else {
+        ansZone.appendChild(token);
+        inAnswer = true;
+      }
+      persistDragState(q.id, ansZone);
+    });
 
-      // Drag events
-      token.addEventListener("dragstart", e => {
-        token.classList.add("dragging");
-        e.dataTransfer.setData("text/plain", text);
-        e.dataTransfer.setData("source", inAnswer ? "answer" : "pool");
-      });
-      token.addEventListener("dragend", () => {
-        token.classList.remove("dragging");
-        persistDragState(q.id, ansZone);
-      });
-    } else {
-      token.classList.add("locked");
-    }
+    // Drag events
+    token.addEventListener("dragstart", e => {
+      token.classList.add("dragging");
+      e.dataTransfer.setData("text/plain", text);
+    });
+    token.addEventListener("dragend", () => {
+      token.classList.remove("dragging");
+      persistDragState(q.id, ansZone);
+    });
+
     return token;
   }
 
@@ -325,9 +363,7 @@ function renderDragDrop(q, container) {
     zone.addEventListener("drop", e => {
       e.preventDefault();
       zone.classList.remove("drag-over");
-      const text   = e.dataTransfer.getData("text/plain");
-      const source = e.dataTransfer.getData("source");
-      const destIsAnswer = zone.id === `ans-zone-${q.id}`;
+      const text = e.dataTransfer.getData("text/plain");
 
       // Find the token in its current home and move it
       const allTokens = document.querySelectorAll(`[data-text="${CSS.escape(text)}"]`);
@@ -339,95 +375,35 @@ function renderDragDrop(q, container) {
     });
   });
 
-  // Check + Reset buttons
-  if (!isChecked) {
-    const checkRow = document.createElement("div");
-    checkRow.className = "check-btn-row";
-
-    const resetBtn = document.createElement("button");
-    resetBtn.className = "btn btn-secondary";
-    resetBtn.textContent = "Reset Sentence";
-    resetBtn.addEventListener("click", () => {
-      ansZone.innerHTML = "";
-      poolZone.innerHTML = "";
-      q.blocks.forEach(text => poolZone.appendChild(makeToken(text, false)));
-      delete state.dragState[q.id];
-      saveProgress();
-    });
-    checkRow.appendChild(resetBtn);
-
-    const checkBtn = document.createElement("button");
-    checkBtn.className = "btn btn-accent";
-    checkBtn.textContent = "Check";
-    checkBtn.addEventListener("click", () => checkDragDrop(q, container, ansZone));
-    checkRow.appendChild(checkBtn);
-
-    container.appendChild(checkRow);
-  }
-
-  // Feedback restore
-  const fb = document.createElement("div");
-  fb.className = "feedback-box";
-  fb.id        = `fb-${q.id}`;
-  container.appendChild(fb);
-
-  if (isChecked) {
-    const ans = state.answers[q.id];
-    showDragFeedback(q, fb, ans ? ans.correct : false, ans ? ans.value : []);
-  }
+  // Reset button (clears the arrangement only — no correctness involved)
+  const actionRow = document.createElement("div");
+  actionRow.className = "check-btn-row";
+  const resetBtn = document.createElement("button");
+  resetBtn.className = "btn btn-secondary";
+  resetBtn.textContent = "Reset Sentence";
+  resetBtn.addEventListener("click", () => {
+    ansZone.innerHTML = "";
+    poolZone.innerHTML = "";
+    q.blocks.forEach(text => poolZone.appendChild(makeToken(text, false)));
+    delete state.dragState[q.id];
+    delete state.answers[q.id];
+    saveProgress();
+    refreshNextButton();
+  });
+  actionRow.appendChild(resetBtn);
+  container.appendChild(actionRow);
 }
 
 function persistDragState(qId, ansZone) {
   const tokens = [...ansZone.querySelectorAll(".drag-token")].map(t => t.dataset.text);
   state.dragState[qId] = tokens;
-  // Mark as not-checked (in case they keep editing)
-  if (!state.checked[qId]) saveProgress();
-}
-
-function checkDragDrop(q, container, ansZone) {
-  const arranged = [...ansZone.querySelectorAll(".drag-token")].map(t => t.dataset.text);
-  if (arranged.length === 0) { alert("Please arrange at least one block first."); return; }
-
-  const fullArranged = [...(q.fixedStart || []), ...arranged];
-  const fullStr = JSON.stringify(fullArranged);
-  const isRight = Array.isArray(q.corrects)
-    ? q.corrects.some(c => JSON.stringify(c) === fullStr)
-    : fullStr === JSON.stringify(q.correct);
-  state.answers[q.id]  = { value: arranged, checked: true, correct: isRight };
-  state.checked[q.id]  = true;
-  state.dragState[q.id] = arranged;
+  state.answers[qId]   = { value: tokens };
   saveProgress();
-
-  // Lock all tokens
-  container.querySelectorAll(".drag-token").forEach(t => {
-    t.draggable  = false;
-    t.classList.add("locked");
-    t.style.cursor = "default";
-  });
-
-  container.querySelector(".check-btn-row")?.remove();
-
-  const fb = $(`fb-${q.id}`);
-  showDragFeedback(q, fb, isRight, arranged);
-}
-
-function showDragFeedback(q, fb, isRight, arranged) {
-  fb.classList.add("visible", isRight ? "correct" : "incorrect");
-  const givenStr = Array.isArray(arranged) ? arranged.join(" ") : arranged;
-  let correctDisplay;
-  if (Array.isArray(q.corrects)) {
-    correctDisplay = q.corrects.map((c, i) => `(${i + 1}) ${c.join(" ")}`).join("<br>");
-  } else {
-    correctDisplay = q.correct.join(" ");
-  }
-  fb.innerHTML = `
-    <div class="feedback-verdict">${isRight ? "✓ Correct" : "✗ Incorrect"}</div>
-    <div class="feedback-detail">
-      ${!isRight ? `Correct order:<br><strong>${correctDisplay}</strong>` : ""}
-    </div>`;
+  refreshNextButton();
 }
 
 // ── Fill-in-the-blank ────────────────────────────────────────
+// Real-exam behavior: no Check button, no correct/incorrect feedback.
 function renderFillin(q, container) {
   const stem = document.createElement("div");
   stem.className = "question-stem";
@@ -439,66 +415,19 @@ function renderFillin(q, container) {
   input.className   = "dictation-input";
   input.placeholder = "Type your answer…";
   input.style.width = "100%";
-  const saved     = state.answers[q.id];
-  const isChecked = state.checked[q.id];
+  const saved = state.answers[q.id];
   if (saved) input.value = saved.value || "";
-  if (isChecked) input.disabled = true;
   container.appendChild(input);
 
   input.addEventListener("input", () => {
-    state.answers[q.id] = { value: input.value, checked: false, correct: false };
+    state.answers[q.id] = { value: input.value };
     saveProgress();
+    refreshNextButton();
   });
-
-  if (!isChecked) {
-    const checkRow = document.createElement("div");
-    checkRow.className = "check-btn-row";
-    const checkBtn = document.createElement("button");
-    checkBtn.className   = "btn btn-accent";
-    checkBtn.textContent = "Check";
-    checkBtn.addEventListener("click", () => checkFillin(q, container, input));
-    checkRow.appendChild(checkBtn);
-    container.appendChild(checkRow);
-  }
-
-  const fb = document.createElement("div");
-  fb.className = "feedback-box";
-  fb.id        = `fb-${q.id}`;
-  container.appendChild(fb);
-
-  if (isChecked && saved) showFillinFeedback(q, fb, saved.value);
-}
-
-function checkFillin(q, container, input) {
-  const typed = input.value.trim().toLowerCase();
-  if (!typed) { alert("Please type your answer first."); return; }
-
-  const accepted = Array.isArray(q.correct) ? q.correct : [q.correct];
-  const isRight  = accepted.some(a => a.toLowerCase() === typed);
-  state.answers[q.id] = { value: input.value.trim(), checked: true, correct: isRight };
-  state.checked[q.id] = true;
-  saveProgress();
-
-  input.disabled = true;
-  container.querySelector(".check-btn-row")?.remove();
-
-  const fb = $(`fb-${q.id}`);
-  showFillinFeedback(q, fb, input.value.trim());
-}
-
-function showFillinFeedback(q, fb, typed) {
-  const accepted = Array.isArray(q.correct) ? q.correct : [q.correct];
-  const isRight  = accepted.some(a => a.toLowerCase() === typed.toLowerCase());
-  fb.classList.add("visible", isRight ? "correct" : "incorrect");
-  fb.innerHTML = `
-    <div class="feedback-verdict">${isRight ? "✓ Correct" : "✗ Incorrect"}</div>
-    <div class="feedback-detail">
-      ${!isRight ? `Correct answer: <strong>${accepted.join(" / ")}</strong><br>` : ""}
-      ${q.explanation}
-    </div>`;
 }
 
 // ── Dictation ─────────────────────────────────────────────────
+// Real-exam behavior: no Check button, no correct/incorrect feedback.
 function renderDictation(q, container) {
   const stem = document.createElement("div");
   stem.className = "question-stem";
@@ -529,66 +458,19 @@ function renderDictation(q, container) {
   input.className    = "dictation-input";
   input.placeholder  = "Type what you hear…";
   input.rows         = 2;
-  const saved        = state.answers[q.id];
-  const isChecked    = state.checked[q.id];
+  const saved = state.answers[q.id];
   if (saved) input.value = saved.value || "";
-  if (isChecked) input.disabled = true;
   container.appendChild(input);
 
   input.addEventListener("input", () => {
-    state.answers[q.id] = { value: input.value, checked: false, correct: false };
+    state.answers[q.id] = { value: input.value };
     saveProgress();
+    refreshNextButton();
   });
-
-  // Check button
-  if (!isChecked) {
-    const checkRow = document.createElement("div");
-    checkRow.className = "check-btn-row";
-    const checkBtn = document.createElement("button");
-    checkBtn.className = "btn btn-accent";
-    checkBtn.textContent = "Check";
-    checkBtn.addEventListener("click", () => checkDictation(q, container, input));
-    checkRow.appendChild(checkBtn);
-    container.appendChild(checkRow);
-  }
-
-  const fb = document.createElement("div");
-  fb.className = "feedback-box";
-  fb.id        = `fb-${q.id}`;
-  container.appendChild(fb);
-
-  if (isChecked && saved) showDictationFeedback(q, fb, saved.value);
-}
-
-function checkDictation(q, container, input) {
-  const typed = input.value.trim();
-  if (!typed) { alert("Please write the sentence first."); return; }
-
-  const isRight = normaliseDictation(typed) === normaliseDictation(q.correct);
-  state.answers[q.id] = { value: typed, checked: true, correct: isRight };
-  state.checked[q.id] = true;
-  saveProgress();
-
-  input.disabled = true;
-  container.querySelector(".check-btn-row")?.remove();
-
-  const fb = $(`fb-${q.id}`);
-  showDictationFeedback(q, fb, typed);
-}
-
-function showDictationFeedback(q, fb, typed) {
-  const isRight = normaliseDictation(typed) === normaliseDictation(q.correct);
-  fb.classList.add("visible", isRight ? "correct" : "incorrect");
-  fb.innerHTML = `
-    <div class="feedback-verdict">${isRight ? "✓ Correct" : "✗ Incorrect"}</div>
-    <div class="feedback-detail">
-      <strong>Your answer:</strong> ${typed}<br>
-      <strong>Correct sentence:</strong> ${q.correct}<br>
-      <em>${q.note}</em>
-    </div>`;
 }
 
 // ── Dictation + Analysis ──────────────────────────────────────
+// Real-exam behavior: no Check button, no correct/incorrect feedback.
 function renderDictationAnalysis(q, container) {
   // Dictation part
   const stem = document.createElement("div");
@@ -614,16 +496,15 @@ function renderDictationAnalysis(q, container) {
   input.className   = "dictation-input";
   input.placeholder = "Type what you hear…";
   input.rows        = 2;
-  const saved       = state.answers[q.id];
-  const isChecked   = state.checked[q.id];
+  const saved = state.answers[q.id];
   if (saved) input.value = saved.dictValue || "";
-  if (isChecked) input.disabled = true;
   container.appendChild(input);
 
   input.addEventListener("input", () => {
     const existing = state.answers[q.id] || {};
-    state.answers[q.id] = { ...existing, dictValue: input.value, checked: false, correct: false };
+    state.answers[q.id] = { ...existing, dictValue: input.value };
     saveProgress();
+    refreshNextButton();
   });
 
   // Separator
@@ -653,88 +534,19 @@ function renderDictationAnalysis(q, container) {
     btn.innerHTML = `<span class="option-key">${key}</span> ${label}`;
 
     if (saved && saved.analysisValue === key) btn.classList.add("selected");
-    if (isChecked) {
-      btn.disabled = true;
-      if (key === q.correctAnalysis) btn.classList.add("correct-ans");
-      else if (saved && saved.analysisValue === key && key !== q.correctAnalysis)
-        btn.classList.add("wrong-ans");
-    } else {
-      btn.addEventListener("click", () => {
-        list.querySelectorAll(".option-btn").forEach(b => b.classList.remove("selected"));
-        btn.classList.add("selected");
-        const existing = state.answers[q.id] || {};
-        state.answers[q.id] = { ...existing, analysisValue: key };
-        saveProgress();
-      });
-    }
+
+    btn.addEventListener("click", () => {
+      list.querySelectorAll(".option-btn").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      const existing = state.answers[q.id] || {};
+      state.answers[q.id] = { ...existing, analysisValue: key };
+      saveProgress();
+      refreshNextButton();
+    });
+
     list.appendChild(btn);
   }
   container.appendChild(list);
-
-  // Check button
-  if (!isChecked) {
-    const checkRow = document.createElement("div");
-    checkRow.className = "check-btn-row";
-    const checkBtn = document.createElement("button");
-    checkBtn.className = "btn btn-accent";
-    checkBtn.textContent = "Check";
-    checkBtn.addEventListener("click", () => checkDictationAnalysis(q, container, input, list));
-    checkRow.appendChild(checkBtn);
-    container.appendChild(checkRow);
-  }
-
-  const fb = document.createElement("div");
-  fb.className = "feedback-box";
-  fb.id        = `fb-${q.id}`;
-  container.appendChild(fb);
-
-  if (isChecked && saved) showDictationAnalysisFeedback(q, fb, saved.dictValue, saved.analysisValue);
-}
-
-function checkDictationAnalysis(q, container, input, list) {
-  const typed    = input.value.trim();
-  const selBtn   = list.querySelector(".option-btn.selected");
-  if (!typed) { alert("Please write the sentence first."); return; }
-  if (!selBtn)  { alert("Please select an analysis answer."); return; }
-
-  const aChosen  = selBtn.dataset.key;
-  const dictOK   = normaliseDictation(typed) === normaliseDictation(q.correct);
-  const analysOK = aChosen === q.correctAnalysis;
-  const isRight  = dictOK && analysOK;
-
-  state.answers[q.id] = {
-    dictValue: typed, analysisValue: aChosen,
-    checked: true, correct: isRight, dictOK, analysOK
-  };
-  state.checked[q.id] = true;
-  saveProgress();
-
-  input.disabled = true;
-  list.querySelectorAll(".option-btn").forEach(btn => {
-    btn.disabled = true;
-    if (btn.dataset.key === q.correctAnalysis) btn.classList.add("correct-ans");
-    else if (btn.dataset.key === aChosen) btn.classList.add("wrong-ans");
-  });
-  container.querySelector(".check-btn-row")?.remove();
-
-  const fb = $(`fb-${q.id}`);
-  showDictationAnalysisFeedback(q, fb, typed, aChosen);
-}
-
-function showDictationAnalysisFeedback(q, fb, dictTyped, aChosen) {
-  const dictOK  = normaliseDictation(dictTyped) === normaliseDictation(q.correct);
-  const analysOK = aChosen === q.correctAnalysis;
-  const isRight  = dictOK && analysOK;
-
-  fb.classList.add("visible", isRight ? "correct" : "incorrect");
-  fb.innerHTML = `
-    <div class="feedback-verdict">${isRight ? "✓ Correct" : "✗ Incorrect"}</div>
-    <div class="feedback-detail">
-      <strong>Your sentence:</strong> ${dictTyped || "(none)"}<br>
-      <strong>Correct sentence:</strong> ${q.correct}<br>
-      <strong>Correct analysis:</strong> ${q.correctAnalysis}. ${q.options[q.correctAnalysis]}<br>
-      <em>${q.explanation}</em>
-    </div>`;
 }
 
 // ============================================================
@@ -749,20 +561,120 @@ function goTo(index) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
+// ============================================================
+//  COURSE FEEDBACK  (unscored — runs after Q95, before results)
+// ============================================================
+
+function goToFeedback() {
+  showScreen("feedback-screen");
+  renderFeedbackScreen();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function renderFeedbackScreen() {
+  const fs_ = $("feedback-screen");
+  const fb  = state.feedback;
+
+  const classChoicesHtml = CLASS_FEEDBACK_OPTIONS.map(opt => `
+    <button type="button" class="option-btn feedback-opt-btn" data-group="classFeedback"
+      data-value="${opt}">${opt}</button>`).join("");
+
+  const gradeChoicesHtml = INSTRUCTOR_GRADE_OPTIONS.map(opt => `
+    <button type="button" class="option-btn feedback-opt-btn" data-group="instructorGrade"
+      data-value="${opt}">${opt}</button>`).join("");
+
+  fs_.innerHTML = `
+    <div class="card">
+      <h2>Course Feedback</h2>
+      <div class="instructions-box">${FEEDBACK_NOTE}</div>
+
+      <div class="question-number" style="margin-top:20px;">1. How did you like this class? <span style="color:var(--color-error)">*</span></div>
+      <div class="options-list" id="fb-classFeedback">${classChoicesHtml}</div>
+
+      <div class="question-number" style="margin-top:20px;">2. What grade would you give Hitoshi for this class? <span style="color:var(--color-error)">*</span></div>
+      <div class="options-list" id="fb-instructorGrade">${gradeChoicesHtml}</div>
+
+      <div class="question-number" style="margin-top:20px;">3. How many bonus points have you received during the class?</div>
+      <textarea id="fb-bonusPointsReported" class="dictation-input" rows="2"
+        placeholder="Type your answer…"></textarea>
+
+      <div class="question-number" style="margin-top:20px;">4. Free Comments</div>
+      <div class="question-stem" style="white-space:pre-line;font-size:0.95rem;">${FREE_COMMENTS_PROMPT}</div>
+      <textarea id="fb-freeComments" class="dictation-input" rows="5"
+        placeholder="Type your comments here (optional)…"></textarea>
+
+      <div id="fb-error" class="feedback-error" style="display:none;color:var(--color-error);margin-top:14px;">
+        Please answer questions 1 and 2 before continuing.
+      </div>
+
+      <div class="text-center mt-20">
+        <button id="btn-feedback-submit" class="btn btn-primary btn-lg">Submit &amp; See Results →</button>
+      </div>
+    </div>`;
+
+  // Restore any previously typed free-text answers (set via .value, not
+  // innerHTML, so stray "</textarea>" etc. in a saved answer can't inject markup).
+  $("fb-bonusPointsReported").value = fb.bonusPointsReported || "";
+  $("fb-freeComments").value = fb.freeComments || "";
+
+  // Restore any previously selected choices
+  fs_.querySelectorAll(".feedback-opt-btn").forEach(btn => {
+    const group = btn.dataset.group;
+    if (fb[group] === btn.dataset.value) btn.classList.add("selected");
+
+    btn.addEventListener("click", () => {
+      fs_.querySelectorAll(`.feedback-opt-btn[data-group="${group}"]`)
+        .forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+      state.feedback[group] = btn.dataset.value;
+      saveProgress();
+    });
+  });
+
+  $("fb-bonusPointsReported").addEventListener("input", (e) => {
+    state.feedback.bonusPointsReported = e.target.value;
+    saveProgress();
+  });
+
+  $("fb-freeComments").addEventListener("input", (e) => {
+    state.feedback.freeComments = e.target.value;
+    saveProgress();
+  });
+
+  $("btn-feedback-submit").addEventListener("click", () => {
+    if (!state.feedback.classFeedback || !state.feedback.instructorGrade) {
+      $("fb-error").style.display = "block";
+      return;
+    }
+    state.feedback.bonusPointsReported = $("fb-bonusPointsReported").value;
+    state.feedback.freeComments        = $("fb-freeComments").value;
+    state.feedbackDone = true;
+    saveProgress();
+    finishQuiz();
+  });
+}
+
 // ── Finish Quiz ───────────────────────────────────────────────
+// Called only by the Course Feedback screen's Submit button (see
+// renderFeedbackScreen), never from the exam itself — Q95's "Continue"
+// button always routes to goToFeedback() first. Do not gate this on
+// state.feedbackDone: that flag is persisted across sessions, so on a
+// student's second pass (e.g. after reloading) it would already be true
+// and this function would jump straight to the result screen, skipping
+// feedback entirely — that was the cause of a real navigation bug.
 function finishQuiz() {
   const score   = calcScore();
   const total   = QUESTIONS.length;
-  const pct     = Math.round((score / total) * 100);
-  const comment = getComment(score);
+  const pct     = Math.round((score / total) * 1000) / 10; // one decimal place
+  const comment = getComment(score); // recorded to the spreadsheet only — never shown to the student
 
-  renderResultScreen(score, total, pct, comment);
+  renderResultScreen(score, total, pct);
   showScreen("result-screen");
   window.scrollTo({ top: 0, behavior: "smooth" });
 
-  // Send to spreadsheet
+  // Send to spreadsheet silently — no submission-status UI on a real exam.
   submitToSpreadsheet(score, pct, comment);
-  
+
   state.attempt = (state.attempt || 0) + 1;
 }
 
@@ -770,128 +682,78 @@ function finishQuiz() {
 //  RESULT SCREEN
 // ============================================================
 
-function renderResultScreen(score, total, pct, comment) {
+const FINAL_GRADE_BANDS = [
+  { min: 90, range: "90% or above", grade: "Possible Grade: A or A+" },
+  { min: 85, range: "85%–89%",      grade: "Possible Grade: B+" },
+  { min: 80, range: "80%–84%",      grade: "Possible Grade: B" },
+  { min: 70, range: "70%–79%",      grade: "Possible Grade: C" },
+  { min: 60, range: "60%–69%",      grade: "Possible Grade: D" },
+  { min: 50, range: "50%–59%",      grade: "Possible Grade: D",
+    note: "(Final decision will depend on attendance, assignment completion, quizzes, bonus points, and other coursework.)" },
+  { min: 0,  range: "Below 50%",    grade: "Possible Grade: F" },
+];
+
+// Picks the single matching band's grade text for a given percentage —
+// used only for the spreadsheet's "Tentative Grade" column. The result
+// screen itself still shows the full static table above; this doesn't
+// change what's displayed to the student.
+function getTentativeGrade(pct) {
+  for (const band of FINAL_GRADE_BANDS) {
+    if (pct >= band.min) return band.grade;
+  }
+  return FINAL_GRADE_BANDS[FINAL_GRADE_BANDS.length - 1].grade;
+}
+
+function renderResultScreen(score, total, pct) {
   const rs = $("result-screen");
+
+  const gradeRowsHtml = FINAL_GRADE_BANDS.map(b => `
+    <tr>
+      <td>${b.range}</td>
+      <td>${b.grade}${b.note ? `<br><span style="font-size:0.82rem;color:var(--color-muted);">${b.note}</span>` : ""}</td>
+    </tr>`).join("");
+
   rs.innerHTML = `
     <div class="card">
       <div class="result-header">
-        <h2>Quiz Results</h2>
-        <div class="student-info">${state.name} &nbsp;|&nbsp; ID: ${state.studentID}</div>
-        <div class="student-info" style="margin-top:4px;font-size:0.82rem;color:var(--color-muted)">
-          ${QUIZ_META.quizID}
-        </div>
+        <h2>Final Exam Completed</h2>
+        <p>Thank you for completing the Modern Pronunciation &amp; Grammar Final Examination.</p>
+        <p>Your responses have been submitted successfully.</p>
       </div>
 
+      <div class="breakdown-title">Exam Result</div>
       <div class="score-display">
         <div class="score-circle">
           <span class="score-number">${score}</span>
           <span class="score-total">out of ${total}</span>
         </div>
-        <div class="score-percent">${pct}%</div>
+        <div class="score-percent">${pct.toFixed(1)}%</div>
       </div>
 
+      <div class="breakdown-title">Estimated Course Grade Based on Final Exam</div>
+      <table class="breakdown-table">
+        <tbody>${gradeRowsHtml}</tbody>
+      </table>
+
+      <div class="breakdown-title">Important</div>
       <div class="comment-box">
-        <div>${comment}</div>
-        <div class="closing-note">${CLOSING_NOTE}</div>
+        <p>This is only an estimate based on your Final Examination score.</p>
+        <p>Your final course grade will also consider:</p>
+        <ul style="margin:8px 0 8px 20px;">
+          <li>Attendance</li>
+          <li>Assignment completion</li>
+          <li>Quiz performance</li>
+          <li>Bonus points</li>
+          <li>Other coursework and overall class performance</li>
+        </ul>
+        <p style="margin-bottom:0;">The instructor may adjust the final course grade after reviewing the complete course record.</p>
       </div>
 
-      ${renderBreakdown()}
-      ${renderReview()}
-
-      <div id="submit-msg" class="submit-msg pending">⏳ Saving to spreadsheet…</div>
-
-      <div class="text-center mt-20">
-        <button class="btn btn-secondary" onclick="restartQuiz()">Retake Quiz</button>
+      <div class="breakdown-title">Course Feedback</div>
+      <div class="comment-box">
+        <p style="margin-bottom:0;">Thank you for your feedback.<br>Your responses have been recorded.</p>
       </div>
     </div>`;
-}
-
-function renderBreakdown() {
-  let html = `<div class="breakdown-title">Section Breakdown</div>
-    <table class="breakdown-table">
-      <thead><tr><th>Section</th><th>Score</th><th>%</th></tr></thead>
-      <tbody>`;
-
-  for (const sec of SECTIONS) {
-    let secScore = 0;
-    const secTotal = sec.questions.length;
-    for (const qId of sec.questions) {
-      const ans = state.answers[qId];
-      if (ans && ans.correct) secScore++;
-    }
-    const secPct = Math.round((secScore / secTotal) * 100);
-    html += `<tr>
-      <td>${sec.name}</td>
-      <td>${secScore} / ${secTotal}</td>
-      <td>${secPct}%</td>
-    </tr>`;
-  }
-  html += `</tbody></table>`;
-  return html;
-}
-
-function renderReview() {
-  const wrong = QUESTIONS.filter(q => {
-    const ans = state.answers[q.id];
-    return !ans || !ans.correct;
-  });
-
-  if (wrong.length === 0) return `<div class="review-title" style="color:var(--color-success)">✓ Perfect score! All answers correct.</div>`;
-
-  let html = `<div class="review-title">Review: Questions to revisit</div>`;
-  for (const q of wrong) {
-    const ans = state.answers[q.id];
-    html += `<div class="review-item">
-      <div class="review-q-num">Question ${q.id} – ${getSectionInfo(q.id)?.name || ""}</div>`;
-
-    if (q.type === "mc") {
-      html += `<div class="review-stem">${q.stem}</div>
-        <div class="review-row"><span class="review-label">Your answer:</span>
-          <span class="given">${ans?.value ? `${ans.value}. ${q.options[ans.value]}` : "(not answered)"}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${q.correct}. ${q.options[q.correct]}</span></div>
-        <div class="review-row"><span class="review-label">Note:</span>
-          <span>${q.explanation}</span></div>`;
-    } else if (q.type === "dragdrop") {
-      const givenWords = Array.isArray(ans?.value)
-        ? [...(q.fixedStart || []), ...ans.value].join(" ")
-        : "(not answered)";
-      html += `<div class="review-stem">${q.instruction}</div>
-        <div class="review-row"><span class="review-label">Your order:</span>
-          <span class="given">${givenWords}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${Array.isArray(q.corrects) ? q.corrects.map((c,i) => `(${i+1}) ${c.join(" ")}`).join(" / ") : q.correct.join(" ")}</span></div>`;
-    } else if (q.type === "fillin") {
-      const accepted = Array.isArray(q.correct) ? q.correct : [q.correct];
-      html += `<div class="review-stem">${q.stem}</div>
-        <div class="review-row"><span class="review-label">Your answer:</span>
-          <span class="given">${ans?.value || "(not answered)"}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${accepted.join(" / ")}</span></div>
-        <div class="review-row"><span class="review-label">Note:</span>
-          <span>${q.explanation}</span></div>`;
-    } else if (q.type === "dictation") {
-      html += `<div class="review-stem">Dictation</div>
-        <div class="review-row"><span class="review-label">Your answer:</span>
-          <span class="given">${ans?.value || "(not answered)"}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${q.correct}</span></div>
-        <div class="review-row"><span class="review-label">Note:</span>
-          <span>${q.note}</span></div>`;
-    } else if (q.type === "dictation_analysis") {
-      html += `<div class="review-stem">Dictation + Analysis</div>
-        <div class="review-row"><span class="review-label">Your sentence:</span>
-          <span class="given">${ans?.dictValue || "(not answered)"}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${q.correct}</span></div>
-        <div class="review-row"><span class="review-label">Analysis:</span>
-          <span class="correct">${q.correctAnalysis}. ${q.options[q.correctAnalysis]}</span></div>
-        <div class="review-row"><span class="review-label">Note:</span>
-          <span>${stripHTML(q.explanation)}</span></div>`;
-    }
-    html += `</div>`;
-  }
-  return html;
 }
 
 // ============================================================
@@ -908,7 +770,9 @@ function buildPayload(score, pct, comment) {
     Name:       state.name,
     Attempt: (state.attempt || 0) + 1,
     Score:      score,
+    TotalQuestions: QUESTIONS.length,
     Percentage: pct + "%",
+    TentativeGrade: getTentativeGrade(pct),
     Comment:    comment,
   };
 
@@ -920,16 +784,7 @@ function buildPayload(score, pct, comment) {
     if (q.type === "mc") {
       payload[colKey] = ans.value || "";
     } else if (q.type === "dragdrop") {
-      payload[colKey] = ans.correct ? "correct" : "incorrect";
-    } else if (q.type === "fillin") {
-      const accepted = Array.isArray(q.correct) ? q.correct : [q.correct];
-      html += `<div class="review-stem">${q.stem}</div>
-        <div class="review-row"><span class="review-label">Your answer:</span>
-          <span class="given">${ans?.value || "(not answered)"}</span></div>
-        <div class="review-row"><span class="review-label">Correct:</span>
-          <span class="correct">${accepted.join(" / ")}</span></div>
-        <div class="review-row"><span class="review-label">Note:</span>
-          <span>${q.explanation}</span></div>`;
+      payload[colKey] = isCorrect(q) ? "correct" : "incorrect";
     } else if (q.type === "fillin") {
       payload[colKey] = ans.value || "";
     } else if (q.type === "dictation") {
@@ -938,37 +793,32 @@ function buildPayload(score, pct, comment) {
       payload[colKey] = `${ans.dictValue || ""} | analysis: ${ans.analysisValue || ""}`;
     }
   }
+
+  // Unscored Course Feedback (not part of QUESTIONS / scoring).
+  payload.classFeedback       = state.feedback.classFeedback       || "";
+  payload.instructorGrade     = state.feedback.instructorGrade     || "";
+  payload.bonusPointsReported = state.feedback.bonusPointsReported || "";
+  payload.freeComments        = state.feedback.freeComments        || "";
+
   return payload;
 }
 
+// Submits silently in the background — the exam result screen shows no
+// submission-status indicator (see requirement: display ONLY the result
+// screen content, nothing else).
 async function submitToSpreadsheet(score, pct, comment) {
   const payload = buildPayload(score, pct, comment);
 
   try {
-await fetch(SCRIPT_URL, {
-  method: "POST",
-  mode: "no-cors",
-  headers: {
-    "Content-Type": "text/plain;charset=utf-8"
-  },
-  body: JSON.stringify(payload)
-});
-
-
-  const msgEl = $("submit-msg");
-if (msgEl) {
-  msgEl.className = "submit-msg success";
-  msgEl.textContent = "✓ Result saved to spreadsheet.";
-}
-} catch (err) {
-  console.error("Submission error:", err);
-  const msgEl = $("submit-msg");
-  if (msgEl) {
-    msgEl.className = "submit-msg failure";
-    msgEl.textContent =
-      "⚠ Result shown, but saving to spreadsheet may have failed. Please check the spreadsheet.";
+    await fetch(SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error("Submission error:", err);
   }
-}
 }
 // ============================================================
 //  PERSISTENCE (localStorage)
@@ -983,8 +833,9 @@ function saveProgress() {
       name:      state.name,
       current:   state.current,
       answers:   state.answers,
-      checked:   state.checked,
       dragState: state.dragState,
+      feedback:     state.feedback,
+      feedbackDone: state.feedbackDone,
     }));
   } catch (e) { /* storage may be full */ }
 }
@@ -1019,9 +870,10 @@ function restartQuiz() {
   if (!confirm("Restart the quiz? Your progress will be cleared.")) return;
   localStorage.removeItem(LS_KEY);
   state.answers  = {};
-  state.checked  = {};
   state.dragState = {};
   state.current  = 0;
+  state.feedback = emptyFeedback();
+  state.feedbackDone = false;
   showScreen("start-screen");
 }
 
@@ -1059,14 +911,16 @@ document.addEventListener("DOMContentLoaded", () => {
     const saved = loadProgress();
     if (saved && saved.studentID === id) {
       state.answers   = saved.answers   || {};
-      state.checked   = saved.checked   || {};
       state.dragState = saved.dragState || {};
       state.current   = saved.current   || 0;
+      state.feedback  = saved.feedback  || emptyFeedback();
+      state.feedbackDone = saved.feedbackDone || false;
     } else {
       state.answers   = {};
-      state.checked   = {};
       state.dragState = {};
       state.current   = 0;
+      state.feedback  = emptyFeedback();
+      state.feedbackDone = false;
     }
 
     showScreen("quiz-screen");
@@ -1082,7 +936,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (state.current < QUESTIONS.length - 1) {
       goTo(state.current + 1);
     } else {
-      finishQuiz();
+      // Q95 always leads to Course Feedback — never straight to results.
+      goToFeedback();
     }
   });
 });

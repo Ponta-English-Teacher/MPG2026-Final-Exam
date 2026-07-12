@@ -9,3 +9,4 @@ node_modules/
 
 # Generated audio files — regenerate with generate-p07-audio.js
 audio/*.mp3
+.vercel
